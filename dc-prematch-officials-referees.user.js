@@ -1,10 +1,9 @@
 // ==UserScript==
 // @name         DC – Prematch Officials
 // @namespace    dkode.dc.referee
-// @version      3.5.0
+// @version      3.6.0
 // @description  Sloupec "Referee available" se jménem rozhodčího z Google tabulky (klik = otevře Lineups a doplní rozhodčího), Check v DC → Hotovo = TRUE, Lineups → automatické hledání rozhodčích podle sportu, "Check all" a "Bez rozhodčích" u soutěží
-// @match        https://dc.livesport.eu/*
-// @match        https://dcstg.livesport.eu/*
+// @match        https://dc.livesport.eu/data/data-checking/prematch-officials*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -727,13 +726,14 @@
   // "Ing. Stefan Macanovic , MSc"    → "Stefan Macanovic"
   // "BA Alain Sadikovski"            → "Alain Sadikovski"
   function cleanName(raw) {
-    const parts = String(raw || '').split(',')
-      .map((part) => part.trim().split(/\s+/).filter((tok) => tok && !isTitle(tok)).join(' '))
-      .filter(Boolean);
-    return parts.join(' ').replace(/\s+/g, ' ').trim();
+    return String(raw || '').trim().split(/\s+/).filter((tok) => tok && !isTitle(tok)).join(' ');
   }
 
-  const splitNames = (cell) => String(cell || '').split(/\s*(?:;|\||\n)\s*/).map(cleanName).filter(Boolean);
+  // Víc rozhodčích v jedné buňce: oddělovač je čárka, středník, | nebo nový řádek.
+  // Část, ve které po odstranění titulů nic nezbude (", BA", ", MSc"), se zahodí,
+  // takže "Christian-Petru Ciochirca , BA" je pořád jeden rozhodčí, ale
+  // "Aleksandar Radonjic, Jakub Izak, Rúben Györfy" jsou tři.
+  const splitNames = (cell) => String(cell || '').split(/\s*(?:,|;|\||\n)\s*/).map(cleanName).filter(Boolean);
   const surnameOf = (name) => { const parts = name.trim().split(/\s+/); return parts.length > 1 ? parts[parts.length - 1] : null; };
 
   // ── Postupné vyplnění slotů ─────────────────────────────────────────────────
