@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DC – Prematch Officials
 // @namespace    dkode.dc.referee
-// @version      3.8.1
+// @version      3.9.0
 // @description  Sloupec "Referee available" se jménem rozhodčího z Google tabulky (klik = otevře Lineups a doplní rozhodčího), Check v DC → Hotovo = TRUE, klik na pitchera = doplní nadhazovače do soupisky (baseball), Lineups → automatické hledání rozhodčích podle sportu, "Check all" a "Bez rozhodčích" u soutěží
 // @match        https://dc.livesport.eu/data/data-checking/prematch-officials*
 // @match        https://dc.livesport.eu/data/data-checking/prematch-resources*
@@ -341,7 +341,7 @@
     th.${PITCH_COL_CLASS} .ref-reload { cursor: pointer; margin-left: 4px; }
     th.${PITCH_COL_CLASS} .ref-err { color: #dc3545; margin-left: 4px; }
     td.${PITCH_COL_CLASS} .p-lb { display: inline-block; width: 12px; color: #999; font-size: 10px; }
-    td.${PITCH_COL_CLASS} .ref-yes { color: #28a745; font-weight: bold; }
+    td.${PITCH_COL_CLASS} .ref-yes { color: #1565c0; font-weight: bold; }   /* pitcheři modře, rozhodčí zeleně */
     td.${PITCH_COL_CLASS} .ref-link { cursor: pointer; text-decoration: underline dotted; }
     td.${PITCH_COL_CLASS} .ref-link:hover { text-decoration: underline; }
     td.${PITCH_COL_CLASS} .ref-no  { color: #bbb; }
@@ -523,14 +523,12 @@
 
   // klik na ikonu v hlavičce = znovu načíst tabulku
   document.addEventListener('click', (e) => {
-    if (e.target.closest(`th.${PITCH_COL_CLASS} .ref-reload`)) {
-      e.preventDefault(); e.stopPropagation();
-      if (pStatus === 'nourl') askSheetUrl(); else loadPitchers();
-      return;
-    }
-    if (!e.target.closest(`th.${COL_CLASS} .ref-reload`)) return;
+    // ⟳ u rozhodčích i u pitcherů načte znovu oba listy najednou
+    if (!e.target.closest(`th.${COL_CLASS} .ref-reload, th.${PITCH_COL_CLASS} .ref-reload`)) return;
     e.preventDefault(); e.stopPropagation();
-    if (status === 'nourl') askSheetUrl(); else loadSheet();
+    if (status === 'nourl') { askSheetUrl(); return; }   // askSheetUrl načte oba listy
+    loadSheet();
+    loadPitchers();
   }, true);
 
 
