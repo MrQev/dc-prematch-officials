@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         DC – Prematch Officials
 // @namespace    dkode.dc.referee
-// @version      3.6.0
+// @version      3.7.0
 // @description  Sloupec "Referee available" se jménem rozhodčího z Google tabulky (klik = otevře Lineups a doplní rozhodčího), Check v DC → Hotovo = TRUE, Lineups → automatické hledání rozhodčích podle sportu, "Check all" a "Bez rozhodčích" u soutěží
 // @match        https://dc.livesport.eu/data/data-checking/prematch-officials*
+// @match        https://dc.livesport.eu/data/data-checking/prematch-resources*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -19,6 +20,99 @@
 
 (function () {
   'use strict';
+
+  // ===========================================================================
+  // BULK CHECK – odznak "✓ Check all" za breadcrumbem soutěže
+  // (převzato z "Bulk Check per Tournament Stage (data-checking tool)" 2.1)
+  // Běží v Prematch Officials i v Prematch Resources. V Officials kliknutí na Check
+  // projdou i přes zápis Hotovo = TRUE do Google tabulky.
+  // ===========================================================================
+  const BULK_CLICK_DELAY_MS = 200;   // prodleva mezi kliky, aby se nezahltil backend
+  const BADGE_CLASS = 'dc-bulk-check-badge';
+
+  function getEventRowsForHeader(headerTr) {
+    const eventRows = [];
+    let sibling = headerTr.nextElementSibling;
+    while (sibling) {
+      if (sibling.classList && sibling.classList.contains('group-label')) break; // další soutěž
+      if (sibling.hasAttribute && sibling.hasAttribute('data-id')) eventRows.push(sibling);
+      sibling = sibling.nextElementSibling;
+    }
+    return eventRows;
+  }
+
+  const getCheckButton = (eventRow) => eventRow.querySelector('a.button[data-action-id*="-doCheck-click"]');
+
+  async function checkAllForTournament(headerTr, statusEl) {
+    const buttons = getEventRowsForHeader(headerTr).map(getCheckButton).filter(Boolean);
+    if (buttons.length === 0) { statusEl.textContent = '✓ Check all (0 eventů)'; return; }
+
+    let done = 0;
+    statusEl.textContent = `⏳ 0/${buttons.length}`;
+    for (const btn of buttons) {
+      btn.click();
+      done += 1;
+      statusEl.textContent = `⏳ ${done}/${buttons.length}`;
+      await new Promise((r) => setTimeout(r, BULK_CLICK_DELAY_MS));
+    }
+    statusEl.textContent = `✅ Checknuto ${done}/${buttons.length}`;
+    setTimeout(() => { statusEl.textContent = '✓ Check all'; }, 2000);
+  }
+
+  function injectBulkBadge(anchor) {
+    // Odznak se hledá kdekoli v breadcrumbu (ne jen hned za kotvou) – jiné skripty
+    // vkládají odznaky na stejné místo a jinak by se navzájem množily.
+    const container = anchor.parentElement || anchor.closest('tr');
+    const existing = container ? Array.from(container.querySelectorAll(':scope > .' + BADGE_CLASS)) : [];
+    if (existing.length) {
+      existing.slice(1).forEach((extra) => extra.remove());
+      return;
+    }
+    const headerTr = anchor.closest('tr');
+    if (!headerTr) return;
+
+    const badge = document.createElement('span');
+    badge.className = BADGE_CLASS;
+    badge.textContent = '✓ Check all';
+    badge.title = 'Odškrtnout Check u všech zápasů této soutěže';
+    Object.assign(badge.style, {
+      cursor: 'pointer', marginLeft: '8px', padding: '2px 8px', border: '1px solid #28a745',
+      borderRadius: '4px', color: '#28a745', fontSize: '12px', fontWeight: 'bold',
+      userSelect: 'none', whiteSpace: 'nowrap', display: 'inline-block',
+    });
+
+    badge.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (badge.dataset.running === '1') return; // ochrana proti double-clicku
+      const freshHeaderTr = anchor.closest('tr') || headerTr;
+      badge.dataset.running = '1';
+      badge.style.opacity = '0.6';
+      await checkAllForTournament(freshHeaderTr, badge);
+      badge.style.opacity = '1';
+      badge.dataset.running = '0';
+    });
+
+    anchor.insertAdjacentElement('afterend', badge);
+  }
+
+  function scanBulkBadges() {
+    document.querySelectorAll('tr.group-label [id$="_path_rh_tournament_stage_0"]').forEach(injectBulkBadge);
+  }
+
+
+  // V Prematch Resources běží JEN "Check all" – nic jiného (sloupec, tabulka, Lineups…).
+  const IS_OFFICIALS = location.pathname.startsWith('/data/data-checking/prematch-officials');
+  if (!IS_OFFICIALS) {
+    scanBulkBadges();
+    let bulkTimer = null;
+    new MutationObserver(() => {
+      clearTimeout(bulkTimer);
+      bulkTimer = setTimeout(scanBulkBadges, 100);
+    }).observe(document.body, { childList: true, subtree: true });
+    setInterval(scanBulkBadges, 1500);   // pojistka, kdyby observer něco propásl
+    return;
+  }
 
   // ---------------------------------------------------------------------------
   // KONFIGURACE
@@ -830,85 +924,6 @@
     pendingLineupNames = splitNames(name);
     fireClickSequence(icon);
   }, true);
-
-
-  // ===========================================================================
-  // BULK CHECK – odznak "✓ Check all" za breadcrumbem soutěže
-  // (převzato z "Bulk Check per Tournament Stage (data-checking tool)" 2.1)
-  // Kliknutí na Check projdou i přes zápis Hotovo = TRUE do Google tabulky výše.
-  // ===========================================================================
-  const BULK_CLICK_DELAY_MS = 200;   // prodleva mezi kliky, aby se nezahltil backend
-  const BADGE_CLASS = 'dc-bulk-check-badge';
-
-  function getEventRowsForHeader(headerTr) {
-    const eventRows = [];
-    let sibling = headerTr.nextElementSibling;
-    while (sibling) {
-      if (sibling.classList && sibling.classList.contains('group-label')) break; // další soutěž
-      if (sibling.hasAttribute && sibling.hasAttribute('data-id')) eventRows.push(sibling);
-      sibling = sibling.nextElementSibling;
-    }
-    return eventRows;
-  }
-
-  const getCheckButton = (eventRow) => eventRow.querySelector('a.button[data-action-id*="-doCheck-click"]');
-
-  async function checkAllForTournament(headerTr, statusEl) {
-    const buttons = getEventRowsForHeader(headerTr).map(getCheckButton).filter(Boolean);
-    if (buttons.length === 0) { statusEl.textContent = '✓ Check all (0 eventů)'; return; }
-
-    let done = 0;
-    statusEl.textContent = `⏳ 0/${buttons.length}`;
-    for (const btn of buttons) {
-      btn.click();
-      done += 1;
-      statusEl.textContent = `⏳ ${done}/${buttons.length}`;
-      await sleep(BULK_CLICK_DELAY_MS);
-    }
-    statusEl.textContent = `✅ Checknuto ${done}/${buttons.length}`;
-    setTimeout(() => { statusEl.textContent = '✓ Check all'; }, 2000);
-  }
-
-  function injectBulkBadge(anchor) {
-    // Odznak se hledá kdekoli v breadcrumbu (ne jen hned za kotvou) – jiné skripty
-    // vkládají odznaky na stejné místo a jinak by se navzájem množily.
-    const container = anchor.parentElement || anchor.closest('tr');
-    const existing = container ? Array.from(container.querySelectorAll(':scope > .' + BADGE_CLASS)) : [];
-    if (existing.length) {
-      existing.slice(1).forEach((extra) => extra.remove());
-      return;
-    }
-    const headerTr = anchor.closest('tr');
-    if (!headerTr) return;
-
-    const badge = document.createElement('span');
-    badge.className = BADGE_CLASS;
-    badge.textContent = '✓ Check all';
-    badge.title = 'Odškrtnout Check u všech zápasů této soutěže';
-    Object.assign(badge.style, {
-      cursor: 'pointer', marginLeft: '8px', padding: '2px 8px', border: '1px solid #28a745',
-      borderRadius: '4px', color: '#28a745', fontSize: '12px', fontWeight: 'bold',
-      userSelect: 'none', whiteSpace: 'nowrap', display: 'inline-block',
-    });
-
-    badge.addEventListener('click', async (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (badge.dataset.running === '1') return; // ochrana proti double-clicku
-      const freshHeaderTr = anchor.closest('tr') || headerTr;
-      badge.dataset.running = '1';
-      badge.style.opacity = '0.6';
-      await checkAllForTournament(freshHeaderTr, badge);
-      badge.style.opacity = '1';
-      badge.dataset.running = '0';
-    });
-
-    anchor.insertAdjacentElement('afterend', badge);
-  }
-
-  function scanBulkBadges() {
-    document.querySelectorAll('tr.group-label [id$="_path_rh_tournament_stage_0"]').forEach(injectBulkBadge);
-  }
 
 
   // ===========================================================================
