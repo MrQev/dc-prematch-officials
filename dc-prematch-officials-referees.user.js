@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DC – Prematch Officials
 // @namespace    dkode.dc.referee
-// @version      3.7.0
-// @description  Sloupec "Referee available" se jménem rozhodčího z Google tabulky (klik = otevře Lineups a doplní rozhodčího), Check v DC → Hotovo = TRUE, Lineups → automatické hledání rozhodčích podle sportu, "Check all" a "Bez rozhodčích" u soutěží
+// @version      3.8.1
+// @description  Sloupec "Referee available" se jménem rozhodčího z Google tabulky (klik = otevře Lineups a doplní rozhodčího), Check v DC → Hotovo = TRUE, klik na pitchera = doplní nadhazovače do soupisky (baseball), Lineups → automatické hledání rozhodčích podle sportu, "Check all" a "Bez rozhodčích" u soutěží
 // @match        https://dc.livesport.eu/data/data-checking/prematch-officials*
 // @match        https://dc.livesport.eu/data/data-checking/prematch-resources*
 // @grant        GM_xmlhttpRequest
@@ -139,14 +139,38 @@
   let status = 'loading';        // loading | ok | error | nourl
   let statusMsg = '';
 
+  // --- Pitcheři (baseball): list ve stejné Google tabulce -------------------
+  const PITCHER_GID = '67554807';                 // list s pitchery (když není nastavený jiný odkaz)
+  const PITCHER_HOME_COLUMN = 'Pitcher domácí';
+  const PITCHER_AWAY_COLUMN = 'Pitcher hosté';
+  const PITCH_COL_CLASS = 'dc-pitch-col';
+  let pitcherMap = new Map();    // eventId -> { home, away }
+  let pitcherIds = new Set();    // všechna DC ID v listu pitcherů
+  let pitcherDone = new Set();   // DC ID s Hotovo = TRUE v listu pitcherů
+  let pStatus = 'loading';
+  let pStatusMsg = '';
+
   // --- nastavení přes menu Tampermonkey -------------------------------------
   const getSheetUrl = () => GM_getValue('sheetUrl', DEFAULT_SHEET_URL);
   function askSheetUrl() {
     const url = prompt('Vlož odkaz na Google tabulku (včetně #gid=… pro konkrétní list):', getSheetUrl());
-    if (url !== null) { GM_setValue('sheetUrl', url.trim()); loadSheet(); }
+    if (url !== null) { GM_setValue('sheetUrl', url.trim()); loadSheet(); loadPitchers(); }
   }
   GM_registerMenuCommand('Nastavit Google tabulku s rozhodčími', askSheetUrl);
-  GM_registerMenuCommand('Znovu načíst rozhodčí', () => loadSheet());
+
+  // List s pitchery: když není nastavený vlastní odkaz, vezme se stejná tabulka a list PITCHER_GID
+  function getPitcherSheetUrl() {
+    const own = GM_getValue('pitcherSheetUrl', '');
+    if (own) return own;
+    const m = getSheetUrl().match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+    return m ? `https://docs.google.com/spreadsheets/d/${m[1]}/edit#gid=${PITCHER_GID}` : '';
+  }
+  function askPitcherSheetUrl() {
+    const url = prompt('Odkaz na list s pitchery (prázdné = stejná tabulka, list ' + PITCHER_GID + '):', GM_getValue('pitcherSheetUrl', ''));
+    if (url !== null) { GM_setValue('pitcherSheetUrl', url.trim()); loadPitchers(); }
+  }
+  GM_registerMenuCommand('Nastavit list s pitchery', askPitcherSheetUrl);
+  GM_registerMenuCommand('Znovu načíst tabulku', () => { loadSheet(); loadPitchers(); });
 
   const getWebAppUrl = () => GM_getValue('webAppUrl', '');
   const getSecret = () => GM_getValue('webAppSecret', '');
@@ -249,6 +273,56 @@
     });
   }
 
+  function loadPitchers() {
+    const csvUrl = buildCsvUrl(getPitcherSheetUrl() || '');
+    if (!csvUrl) {
+      pStatus = 'nourl'; pStatusMsg = 'Nastav odkaz na tabulku v menu Tampermonkey';
+      apply(); return;
+    }
+    pStatus = 'loading'; apply();
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url: csvUrl,
+      onload: (res) => {
+        const text = res.responseText || '';
+        if (res.status !== 200 || /^\s*<(!doctype|html)/i.test(text)) {
+          pStatus = 'error';
+          pStatusMsg = `List s pitchery se nepodařilo načíst (HTTP ${res.status})`;
+          apply(); return;
+        }
+        const rows = parseCsv(text);
+        let headerRow = -1, idIdx = -1, homeIdx = -1, awayIdx = -1;
+        for (let i = 0; i < Math.min(HEADER_SEARCH_ROWS, rows.length); i++) {
+          const a = resolveColumn(rows[i], ID_COLUMN, ID_HEADER_GUESSES);
+          const b = resolveColumn(rows[i], PITCHER_HOME_COLUMN, []);
+          const c = resolveColumn(rows[i], PITCHER_AWAY_COLUMN, []);
+          if (a >= 0 && b >= 0 && c >= 0) { headerRow = i; idIdx = a; homeIdx = b; awayIdx = c; break; }
+        }
+        if (headerRow < 0) {
+          pStatus = 'error';
+          pStatusMsg = `V listu s pitchery chybí sloupce "${ID_COLUMN}", "${PITCHER_HOME_COLUMN}" nebo "${PITCHER_AWAY_COLUMN}"`;
+          apply(); return;
+        }
+        const doneIdx = resolveColumn(rows[headerRow], DONE_COLUMN, ['hotovo', 'done']);
+        const map = new Map(), ids = new Set(), done = new Set();
+        for (const r of rows.slice(headerRow + 1)) {
+          const id = String(r[idIdx] || '').replace(/\D/g, '');
+          if (!id) continue;
+          ids.add(id);
+          const home = String(r[homeIdx] || '').trim();
+          const away = String(r[awayIdx] || '').trim();
+          if (home || away) map.set(id, { home, away });
+          if (doneIdx >= 0 && /^(true|pravda|1|ano|x|✓|✔)$/i.test(String(r[doneIdx] || '').trim())) done.add(id);
+        }
+        pitcherMap = map; pitcherIds = ids; pitcherDone = done;
+        pStatus = 'ok';
+        pStatusMsg = `Načteno ${map.size} zápasů s pitchery (${new Date().toLocaleTimeString()})`;
+        apply();
+      },
+      onerror: () => { pStatus = 'error'; pStatusMsg = 'Chyba sítě při načítání listu s pitchery'; apply(); },
+    });
+  }
+
   // --- styly -----------------------------------------------------------------
   const style = document.createElement('style');
   style.textContent = `
@@ -262,6 +336,18 @@
     td.${COL_CLASS} .ref-sending { margin-left: 4px; }
     td.${COL_CLASS} .ref-fail { color: #dc3545; margin-left: 4px; }
     th.${COL_CLASS} .ref-err { color: #dc3545; margin-left: 4px; }
+    th.${PITCH_COL_CLASS} { white-space: nowrap; }
+    td.${PITCH_COL_CLASS} { text-align: left; white-space: nowrap; }
+    th.${PITCH_COL_CLASS} .ref-reload { cursor: pointer; margin-left: 4px; }
+    th.${PITCH_COL_CLASS} .ref-err { color: #dc3545; margin-left: 4px; }
+    td.${PITCH_COL_CLASS} .p-lb { display: inline-block; width: 12px; color: #999; font-size: 10px; }
+    td.${PITCH_COL_CLASS} .ref-yes { color: #28a745; font-weight: bold; }
+    td.${PITCH_COL_CLASS} .ref-link { cursor: pointer; text-decoration: underline dotted; }
+    td.${PITCH_COL_CLASS} .ref-link:hover { text-decoration: underline; }
+    td.${PITCH_COL_CLASS} .ref-no  { color: #bbb; }
+    td.${PITCH_COL_CLASS} .ref-done { color: #28a745; margin-left: 4px; }
+    td.${PITCH_COL_CLASS} .ref-sending { margin-left: 4px; }
+    td.${PITCH_COL_CLASS} .ref-fail { color: #dc3545; margin-left: 4px; }
     .dc-ref-no-referees-badge {
       display: inline-block; background: rgba(255,0,70,0.14); color: #FF0046;
       font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
@@ -283,50 +369,101 @@
       `<span class="ref-reload ${status === 'ok' || status === 'loading' ? '' : 'ref-err'}" title="${esc(statusMsg || 'Načíst znovu')}">${icon}</span>`;
   }
 
-  function renderCell(td, eventId) {
+  const sportOfLabel = (tr) => (tr.querySelector('a[href^="/jsx/data/sport"]')?.textContent || '').trim().toLowerCase();
+  const isBaseball = (sport) => /baseball/.test(sport || '');
+
+  function markFor(eventId, doneSetForColumn) {
+    if (sendingSet.has(eventId)) return 'sending';
+    if (failMap.has(eventId)) return 'fail';
+    return doneSetForColumn.has(eventId) ? 'done' : '';
+  }
+  function markHtml(mark, eventId) {
+    if (mark === 'done') return '<span class="ref-done" title="V tabulce Hotovo = TRUE">☑</span>';
+    if (mark === 'sending') return '<span class="ref-sending" title="Zapisuji do tabulky…">⏳</span>';
+    if (mark === 'fail') return `<span class="ref-fail" title="${esc(failMap.get(eventId))}">⚠</span>`;
+    return '';
+  }
+
+  function renderCell(td, eventId, sport) {
     const name = refMap.get(eventId);
-    const mark = sendingSet.has(eventId) ? 'sending' : (failMap.has(eventId) ? 'fail' : (doneSet.has(eventId) ? 'done' : ''));
-    const key = `${status}|${name || ''}|${mark}`;
+    const clickable = !isBaseball(sport);   // u baseballu se rozhodčí nedoplňují
+    const mark = markFor(eventId, doneSet);
+    const key = `${status}|${name || ''}|${mark}|${clickable}`;
     if (td.dataset.key === key) return;
     td.dataset.key = key;
     let html;
     if (status === 'loading' && !refMap.size) html = '<span class="ref-no">…</span>';
-    else if (name) html = `<span class="ref-yes ref-link" title="Kliknutím otevřeš Lineups a doplníš rozhodčího: ${esc(name)}">${esc(name)}</span>`;
+    else if (name && clickable) html = `<span class="ref-yes ref-link" title="Kliknutím otevřeš Lineups a doplníš rozhodčího: ${esc(name)}">${esc(name)}</span>`;
+    else if (name) html = `<span class="ref-yes" title="U baseballu se rozhodčí nedoplňují">${esc(name)}</span>`;
     else html = '<span class="ref-no" title="Rozhodčí v tabulce není">—</span>';
-    if (mark === 'done') html += '<span class="ref-done" title="V tabulce Hotovo = TRUE">☑</span>';
-    if (mark === 'sending') html += '<span class="ref-sending" title="Zapisuji do tabulky…">⏳</span>';
-    if (mark === 'fail') html += `<span class="ref-fail" title="${esc(failMap.get(eventId))}">⚠</span>`;
-    td.innerHTML = html;
+    td.innerHTML = html + markHtml(mark, eventId);
+  }
+
+  function renderPitchHeader(th) {
+    const icon = pStatus === 'loading' ? '⏳' : (pStatus === 'ok' ? '⟳' : '⚠');
+    const key = `${pStatus}|${pStatusMsg}`;
+    if (th.dataset.key === key) return;
+    th.dataset.key = key;
+    th.innerHTML = `<span class="ws-nowrap">Pitchers</span>` +
+      `<span class="ref-reload ${pStatus === 'ok' || pStatus === 'loading' ? '' : 'ref-err'}" title="${esc(pStatusMsg || 'Načíst znovu')}">${icon}</span>`;
+  }
+
+  function renderPitchCell(td, eventId, sport) {
+    const p = pitcherMap.get(eventId);
+    const mark = p ? markFor(eventId, pitcherDone) : '';
+    const key = `${pStatus}|${p ? p.home + '|' + p.away : ''}|${mark}|${isBaseball(sport)}`;
+    if (td.dataset.key === key) return;
+    td.dataset.key = key;
+    if (!p) {
+      td.innerHTML = isBaseball(sport) ? '<span class="ref-no" title="Zápas v listu s pitchery není">—</span>' : '';
+      return;
+    }
+    const line = (label, who, name) => `<div><span class="p-lb">${label}</span>` + (name
+      ? `<span class="ref-yes ref-link" title="Kliknutím otevřeš Lineups a doplníš pitchery (${who}: ${esc(name)})">${esc(name)}</span>`
+      : '<span class="ref-no">—</span>') + '</div>';
+    td.innerHTML = line('D', 'domácí', p.home).replace('</div>', markHtml(mark, eventId) + '</div>') + line('H', 'hosté', p.away);
+  }
+
+  function placeAfter(parent, prev, tag, cls) {
+    let el = parent.querySelector(`:scope > ${tag}.${cls}`);
+    if (!el || el.previousElementSibling !== prev) {
+      if (el) el.remove();
+      el = document.createElement(tag);
+      el.className = cls;
+      prev.after(el);
+    }
+    return el;
   }
 
   function apply() {
     const table = document.getElementById('dlist_table');
     if (!table) return;
-
     const headRow = table.querySelector('thead tr');
     const epsTh = headRow && headRow.querySelector('th[id*="_ch_eps_"]');
     if (!epsTh) return;
-    let th = headRow.querySelector(`th.${COL_CLASS}`);
-    if (!th || th.previousElementSibling !== epsTh) {
-      if (th) th.remove();
-      th = document.createElement('th');
-      th.className = COL_CLASS;
-      epsTh.after(th);
-    }
-    renderHeader(th);
 
-    table.querySelectorAll('#dlist_table_tbody > tr[id^="dlist_table_row_"]').forEach((tr) => {
+    const rows = [];
+    let sport = '';
+    table.querySelectorAll('#dlist_table_tbody > tr').forEach((tr) => {
+      if (tr.classList.contains('group-label')) { sport = sportOfLabel(tr); return; }
+      if (/^dlist_table_row_\d+$/.test(tr.id) && tr.dataset.id) rows.push({ tr, sport });
+    });
+    // sloupec Pitchers jen když je na stránce baseball nebo zápas z listu pitcherů
+    const needPitch = rows.some((r) => isBaseball(r.sport) || pitcherMap.has(r.tr.dataset.id));
+
+    const th = placeAfter(headRow, epsTh, 'th', COL_CLASS);
+    renderHeader(th);
+    if (needPitch) renderPitchHeader(placeAfter(headRow, th, 'th', PITCH_COL_CLASS));
+    else headRow.querySelector(`:scope > th.${PITCH_COL_CLASS}`)?.remove();
+
+    rows.forEach(({ tr, sport: rowSport }) => {
       const eventId = tr.dataset.id;
       const epsTd = tr.querySelector('.rh-event-participants')?.closest('td');
-      if (!eventId || !epsTd) return;
-      let td = tr.querySelector(`td.${COL_CLASS}`);
-      if (!td || td.previousElementSibling !== epsTd) {
-        if (td) td.remove();
-        td = document.createElement('td');
-        td.className = COL_CLASS;
-        epsTd.after(td);
-      }
-      renderCell(td, eventId);
+      if (!epsTd) return;
+      const td = placeAfter(tr, epsTd, 'td', COL_CLASS);
+      renderCell(td, eventId, rowSport);
+      if (needPitch) renderPitchCell(placeAfter(tr, td, 'td', PITCH_COL_CLASS), eventId, rowSport);
+      else tr.querySelector(`:scope > td.${PITCH_COL_CLASS}`)?.remove();
     });
   }
 
@@ -336,7 +473,10 @@
   let flushTimer = null;
 
   function queueDone(eventId) {
-    if (!sheetIds.has(eventId) || doneSet.has(eventId)) return; // zápas v tabulce není / už je hotovo
+    // zápas není v žádném listu / všude už je hotovo
+    const needsRef = sheetIds.has(eventId) && !doneSet.has(eventId);
+    const needsPitch = pitcherIds.has(eventId) && !pitcherDone.has(eventId);
+    if (!needsRef && !needsPitch) return;
     if (!getWebAppUrl()) {
       failMap.set(eventId, 'Není nastavený zápis – menu Tampermonkey → Nastavit zápis do tabulky');
       apply(); return;
@@ -360,7 +500,11 @@
         let json;
         try { json = JSON.parse(res.responseText); } catch { return fail(`Neočekávaná odpověď (HTTP ${res.status}) – zkontroluj nasazení web app`); }
         if (!json.ok) return fail(json.error || 'Chyba zápisu');
-        (json.updated || []).forEach((id) => { sendingSet.delete(id); doneSet.add(id); });
+        (json.updated || []).forEach((id) => {
+          sendingSet.delete(id);
+          if (sheetIds.has(id)) doneSet.add(id);
+          if (pitcherIds.has(id)) pitcherDone.add(id);
+        });
         (json.notFound || []).forEach((id) => { sendingSet.delete(id); failMap.set(id, 'DC ID v tabulce nenalezeno'); });
         ids.forEach((id) => sendingSet.delete(id));
         apply();
@@ -379,6 +523,11 @@
 
   // klik na ikonu v hlavičce = znovu načíst tabulku
   document.addEventListener('click', (e) => {
+    if (e.target.closest(`th.${PITCH_COL_CLASS} .ref-reload`)) {
+      e.preventDefault(); e.stopPropagation();
+      if (pStatus === 'nourl') askSheetUrl(); else loadPitchers();
+      return;
+    }
     if (!e.target.closest(`th.${COL_CLASS} .ref-reload`)) return;
     e.preventDefault(); e.stopPropagation();
     if (status === 'nourl') askSheetUrl(); else loadSheet();
@@ -406,7 +555,7 @@
     basketball:     3,
     handball:       2,
     volleyball:     2,
-    baseball:       6,
+    baseball:       0,   // u baseballu se rozhodčí nedoplňují (jen pitcheři přes sloupec Pitchers)
     'rugby league': 3,
     'rugby union':  1,
   };
@@ -647,7 +796,7 @@
   async function openSearchForRow(row, slotIndex) {
     const trigger = row.querySelector(SEARCH_TRIGGER_SELECTOR);
     if (!trigger) return false;
-    const psId = row.querySelector('.participant-select')?.id || null;
+    const psId = (row.matches?.('.participant-select') ? row.id : row.querySelector('.participant-select')?.id) || null;
     const rootBefore = getDatalistRoot();
     const isOpen = () => {
       if (psId) {
@@ -779,23 +928,34 @@
     }
   }
 
-  async function searchByName(query) {
+  async function searchByName(query, submit = true) {
     const input = await waitFor(() => {
       const el = getDatalistRoot()?.querySelector(NAME_FILTER_SELECTOR);
       return el && isRendered(el) ? el : null;
     }, 5000, 100);
     if (!input) { log('search field not found – search manually'); return false; }
 
-    log(`searching "${query}"`);
+    log(`${submit ? 'searching' : 'filtering'} "${query}"`);
     input.focus();
     armAutoPick('script');                 // stav seznamu PŘED hledáním
     setNativeValue(input, query);
     await sleep(150);
+    if (submit) submitSearch(input, false);
+    return true;
+  }
+
+  const findSearchInput = () => {
+    const el = getDatalistRoot()?.querySelector(NAME_FILTER_SELECTOR);
+    return el && isRendered(el) ? el : null;
+  };
+
+  // Odeslat hledání (tlačítko Search, jinak Enter) = globální hledání
+  function submitSearch(input, rearm) {
+    if (rearm) armAutoPick('script');
     const root = getDatalistRoot();
     const btn = root && Array.from(root.querySelectorAll('button')).find((b) =>
       isRendered(b) && (b.getAttribute('data-test-id') === 'datalist-controls-search-button' || /^search\b/i.test(b.textContent.trim())));
     if (btn) fireClickSequence(btn); else pressEnter(input);
-    return true;
   }
 
   // Akademické tituly, které se z jména před hledáním odstraní (před i za jménem).
@@ -892,6 +1052,7 @@
     const alive = () => run === currentRun;
     pinnedFormation = null;
     const { refereeCount } = detectSport(clickedIcon);
+    if (refereeCount === 0) { log('referees are not filled for this sport'); return; }
     if (names.length > refereeCount) log(`${names.length} names in the sheet, but the sport needs ${refereeCount} – extra names ignored`);
     const refs = await ensureRefereeRows(refereeCount, alive, formationsBefore);
     if (!alive()) return;
@@ -899,17 +1060,163 @@
     await openSearchesSequentially(refereeCount, names, alive);
   }
 
-  // Jména pro nejbližší klik na Lineups (nastaví se klikem na jméno ve sloupci)
-  let pendingLineupNames = null;
+  // ===========================================================================
+  // LINEUPS – PITCHEŘI (BASEBALL)
+  // Klik na jméno ve sloupci Pitchers: otevře Lineups, v soupisce domácích i hostů
+  // vezme řádek Pitchera (když soupiska prázdná, přidá 1 položku přes "Add items" –
+  // první pozice je vždy Pitcher), vepíše jméno → nejdřív se filtrují hráči týmu,
+  // když nikdo neodpovídá, spustí se globální hledání (pak případně jen příjmení).
+  // Jediný odpovídající výsledek se vybere sám. Uloží se, až jsou doplnění oba.
+  // ===========================================================================
+  const PITCHER_POSITION_VALUE = '50';   // "- Lineup Position -" → Pitcher
+
+  function instanceRootOf(el) {
+    let n = el;
+    while (n && !(n.id && /^cml_instance_\d+$/.test(n.id))) n = n.parentElement;
+    return n;
+  }
+
+  // Řádky soupisky týmu: div.lineup-line (každý s vlastním participant-select)
+  function lineupRows(instId, side) {
+    const box = document.getElementById(`${instId}_epl_${side}`);
+    if (!box) return [];
+    return Array.from(box.querySelectorAll('.participant-select'))
+      .map((ps) => ps.closest('.lineup-line') || ps.closest('.lineup-item-row') || ps);
+  }
+
+  const positionSelect = (row) => row.querySelector('select[id$="_position"]');
+  const isPitcherRow = (row) => {
+    const sel = positionSelect(row);
+    return !!sel && (sel.value === PITCHER_POSITION_VALUE || sel.options[sel.selectedIndex]?.textContent.trim() === 'Pitcher');
+  };
+
+  const pitcherRow = (instId, side) => lineupRows(instId, side).find(isPitcherRow) || null;
+
+  // počkat, až se dotáhnou i soupisky týmů (ne jen sekce Officials)
+  async function waitForLineupContent(inst, alive) {
+    let lastSig = null, stableSince = Date.now();
+    return waitFor(() => {
+      if (!alive()) return 'aborted';
+      if (!document.getElementById(`${inst.id}_epl_home_control_panel`)) return null;
+      const sig = `${inst.querySelectorAll('.participant-select').length}|${inst.textContent.length}`;
+      if (sig !== lastSig) { lastSig = sig; stableSince = Date.now(); return null; }
+      if (inst.querySelector('.ant-spin[aria-busy="true"], .ant-spin-spinning')) { stableSince = Date.now(); return null; }
+      return Date.now() - stableSince >= LINEUP_STABLE_MS ? true : null;
+    }, LINEUP_LOAD_TIMEOUT_MS, 150);
+  }
+
+  async function addLineupItem(instId, side) {
+    const count = document.getElementById(`${instId}_epl_${side}_control_panel_add_count`);
+    if (count && count.value !== '1') {
+      count.value = '1';
+      count.dispatchEvent(new Event('change', { bubbles: true }));
+      await sleep(150);
+    }
+    const add = document.querySelector(`[data-action-id="${instId}_epl_${side}_control_panel-doAddItems-click"]`);
+    if (!add) return false;
+    fireClickSequence(add);
+    return !!(await waitFor(() => lineupRows(instId, side).length > 0 || null, 5000, 100));
+  }
+
+  async function fillPitcher(instId, side, rawName, alive) {
+    const name = splitNames(rawName)[0] || '';   // jedno jméno, bez titulů (i za čárkou)
+    if (!name) return 'skip';
+    let row = pitcherRow(instId, side);
+    if (!row) {
+      if (lineupRows(instId, side).length) {
+        log(`${side}: lineup already has players but no Pitcher – fill it manually`);
+        return 'fail';
+      }
+      log(`${side}: empty lineup, adding 1 item`);
+      for (let attempt = 1; attempt <= ADD_ROW_ATTEMPTS && !lineupRows(instId, side).length; attempt++) {
+        await addLineupItem(instId, side);
+        await sleep(300);
+      }
+      const first = lineupRows(instId, side)[0];
+      if (!first) { log(`${side}: could not add a lineup row`); return 'fail'; }
+      // první položka je v DC vždy Pitcher – kdyby ne, nastavit pozici
+      const sel = positionSelect(first);
+      if (sel && !isPitcherRow(first) && Array.from(sel.options).some((o) => o.value === PITCHER_POSITION_VALUE)) {
+        log(`${side}: setting position to Pitcher`);
+        sel.value = PITCHER_POSITION_VALUE;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        await sleep(AFTER_ADD_ROW_WAIT_MS);
+      }
+      row = pitcherRow(instId, side) || lineupRows(instId, side)[0];
+    }
+    if (!isRowEmpty(row)) { log(`${side}: pitcher already filled, skipping`); return 'skip'; }
+    if (!row.querySelector(SEARCH_TRIGGER_SELECTOR)) { log(`${side}: no search trigger in the pitcher row`); return 'fail'; }
+
+    resetAutoPick();
+    await openSearchForRow(row, 0);
+    await searchByName(name, false);       // jen filtr předvyplněných hráčů týmu
+    let submitted = false, fallbackTried = false;
+
+    const filled = await waitFor(() => {
+      if (!alive()) return 'aborted';
+      const result = autoPickTick();
+      if (result === 'none') {
+        const input = findSearchInput();
+        if (!submitted && input) {
+          submitted = true;
+          log(`${side}: "${name}" not among team players, searching globally`);
+          submitSearch(input, true);
+        } else if (submitted && !fallbackTried && SURNAME_FALLBACK) {
+          fallbackTried = true;
+          const surname = surnameOf(name);
+          if (surname) { log(`${side}: no result for "${name}", trying "${surname}"`); searchByName(surname, true); }
+        }
+      }
+      const r = pitcherRow(instId, side);
+      return r && !isRowEmpty(r) ? true : null;
+    }, SELECTION_TIMEOUT_MS, POLL_INTERVAL_MS);
+
+    if (filled === 'aborted') return 'aborted';
+    if (!filled) { log(`${side}: timeout waiting for the pitcher`); return 'fail'; }
+    log(`${side}: pitcher filled`);
+    await sleep(AFTER_SELECTION_WAIT_MS);
+    return 'filled';
+  }
+
+  async function openPitcherFill(clickedIcon, names, formationsBefore) {
+    const run = ++currentRun;            // nové otevření Lineups ukončí předchozí běh
+    const alive = () => run === currentRun;
+    pinnedFormation = null;
+    const formation = await waitForFreshLineup(formationsBefore, alive);
+    if (!alive()) return;
+    if (!formation) { log('lineup not found'); return; }
+    pinnedFormation = formation;
+    const inst = instanceRootOf(formation);
+    if (!inst) { log('lineup instance not found'); return; }
+    if ((await waitForLineupContent(inst, alive)) !== true) return;
+
+    let changed = false;
+    for (const side of ['home', 'away']) {
+      if (!names[side]) continue;
+      const result = await fillPitcher(inst.id, side, names[side], alive);
+      if (result === 'aborted' || !alive()) return;
+      if (result === 'fail') { log(`NOT saving – ${side} pitcher not filled`); return; }
+      if (result === 'filled') changed = true;
+    }
+    if (!changed) { log('pitchers already filled, nothing to save'); return; }
+    await sleep(200);
+    const btn = Array.from(inst.querySelectorAll(SAVE_BTN_SELECTOR)).find((el) => el.offsetParent !== null);
+    if (btn) { log('clicking Save'); btn.click(); } else clickSave();
+  }
+
+  // Akce pro nejbližší klik na Lineups (nastaví ji klik na jméno ve sloupci):
+  // { type: 'referees', names } | { type: 'pitchers', home, away }
+  let pendingLineupAction = null;
 
   document.addEventListener('click', (event) => {
     const icon = event.target.closest?.(LINEUPS_ICON_SELECTOR);
     if (!icon) return;
-    const names = pendingLineupNames || [];
-    pendingLineupNames = null;
+    const action = pendingLineupAction;
+    pendingLineupAction = null;
     // snímek soupisek, které jsou vidět PŘED tím, než DC na klik zareaguje
     const formationsBefore = new Set(visibleFormations());
-    openRefereeSearch(icon, names, formationsBefore);
+    if (action && action.type === 'pitchers') openPitcherFill(icon, action, formationsBefore);
+    else openRefereeSearch(icon, (action && action.names) || [], formationsBefore);
   }, true);
 
   // Klik na jméno rozhodčího ve sloupci → otevřít Lineups toho zápasu a doplnit
@@ -921,7 +1228,20 @@
     const name = tr && refMap.get(tr.dataset.id);
     const icon = tr && tr.querySelector(LINEUPS_ICON_SELECTOR);
     if (!name || !icon) { log('Lineups icon or referee name not found for this row'); return; }
-    pendingLineupNames = splitNames(name);
+    pendingLineupAction = { type: 'referees', names: splitNames(name) };
+    fireClickSequence(icon);
+  }, true);
+
+  // Klik na pitchera ve sloupci Pitchers → otevřít Lineups a doplnit oba pitchery
+  document.addEventListener('click', (e) => {
+    const link = e.target.closest?.(`td.${PITCH_COL_CLASS} .ref-link`);
+    if (!link) return;
+    e.preventDefault(); e.stopPropagation();
+    const tr = link.closest('tr[id^="dlist_table_row_"]');
+    const p = tr && pitcherMap.get(tr.dataset.id);
+    const icon = tr && tr.querySelector(LINEUPS_ICON_SELECTOR);
+    if (!p || !icon) { log('Lineups icon or pitchers not found for this row'); return; }
+    pendingLineupAction = { type: 'pitchers', home: p.home, away: p.away };
     fireClickSequence(icon);
   }, true);
 
@@ -1008,5 +1328,6 @@
   observer.observe(document.body, { childList: true, subtree: true });
   setInterval(() => { scanBulkBadges(); annotateNoRefereeTournaments(); }, 1500);   // pojistka, kdyby observer něco propásl
   loadSheet();
-  setInterval(loadSheet, REFRESH_MINUTES * 60 * 1000);
+  loadPitchers();
+  setInterval(() => { loadSheet(); loadPitchers(); }, REFRESH_MINUTES * 60 * 1000);
 })();
