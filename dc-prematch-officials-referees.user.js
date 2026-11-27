@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DC – Prematch Officials
 // @namespace    dkode.dc.referee
-// @version      3.10.0
+// @version      3.11.1
 // @description  Sloupec "Referee available" se jménem rozhodčího z Google tabulky (klik = otevře Lineups a doplní rozhodčího), Check v DC → Hotovo = TRUE, klik na pitchera = doplní nadhazovače do soupisky (baseball), Lineups → automatické hledání rozhodčích podle sportu, "Check all" a "Bez rozhodčích" u soutěží, štítky Scan / Ruční skript podle listu Soutěže
 // @match        https://dc.livesport.eu/data/data-checking/prematch-officials*
 // @match        https://dc.livesport.eu/data/data-checking/prematch-resources*
@@ -399,22 +399,19 @@
     td.${PITCH_COL_CLASS} .ref-done { color: #28a745; margin-left: 4px; }
     td.${PITCH_COL_CLASS} .ref-sending { margin-left: 4px; }
     td.${PITCH_COL_CLASS} .ref-fail { color: #dc3545; margin-left: 4px; }
-    .dc-mode-badge {
-      display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.04em; padding: 2px 6px; border-radius: 4px; margin-left: 6px; white-space: nowrap;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    /* štítky vzhledem stejné jako "✓ Check all": rámeček, bez pozadí */
+    .dc-mode-badge, .dc-ref-no-referees-badge {
+      display: inline-block; margin-left: 8px; padding: 2px 8px;
+      border: 1px solid currentColor; border-radius: 4px; background: transparent;
+      font-size: 12px; font-weight: bold; white-space: nowrap; user-select: none;
     }
     .dc-mode-badges { display: inline; }
-    .dc-mode-badge.mode-scan   { background: rgba(21,101,192,0.12); color: #1565c0; }
-    .dc-mode-badge.mode-manual { background: rgba(230,120,0,0.15); color: #c25e00; }
-    .dc-mode-badge.mode-skip   { background: rgba(0,0,0,0.05); color: #888; border: 1px solid #ccc; }
+    .dc-mode-badge.mode-scan   { color: #1565c0; }
+    .dc-mode-badge.mode-manual { color: #c25e00; }
+    .dc-mode-badge.mode-skip   { color: #888; }
+    .dc-ref-no-referees-badge  { color: #FF0046; }
+
     tr.dc-mode-skip-row { opacity: 0.55; }
-    .dc-ref-no-referees-badge {
-      display: inline-block; background: rgba(255,0,70,0.14); color: #FF0046;
-      font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
-      padding: 2px 6px; border-radius: 4px; margin-left: 8px; white-space: nowrap;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    }
   `;
   document.head.appendChild(style);
 
@@ -1376,6 +1373,13 @@
   // Soutěž, která v listu není, zůstane beze štítku. "Neřešit" = v listu je,
   // ale nemá "ano" ani u Scan, ani u Ruční skript → skupina se ztlumí.
   // ===========================================================================
+  const ROW_LOOK = {
+    'dc-mode-row-scan':   { bg: 'rgba(21, 101, 192, 0.1)', bar: 'inset 4px 0 0 #1565c0' },
+    'dc-mode-row-manual': { bg: 'rgba(230, 120, 0, 0.12)', bar: 'inset 4px 0 0 #c25e00' },
+    'dc-mode-row-both':   { bg: 'linear-gradient(90deg, rgba(21, 101, 192, 0.12), rgba(230, 120, 0, 0.14))', bar: 'inset 4px 0 0 #1565c0' },
+    'dc-mode-row-skip':   { bg: 'rgba(0, 0, 0, 0.04)', bar: 'inset 4px 0 0 #bbb' },
+  };
+
   function annotateCompetitionModes() {
     document.querySelectorAll('tr.group-label').forEach((labelTr) => {
       const tplLink = labelTr.querySelector('[id$="_path_rh_tournament_template_0"] a');
@@ -1407,11 +1411,37 @@
         }
       }
 
+      // obarvení hlavičky podle zpracování
+      const rowCls = !mode ? '' : skip ? 'dc-mode-row-skip'
+        : mode.scan && mode.manual ? 'dc-mode-row-both' : mode.scan ? 'dc-mode-row-scan' : 'dc-mode-row-manual';
+      ['dc-mode-row-scan', 'dc-mode-row-manual', 'dc-mode-row-both', 'dc-mode-row-skip'].forEach((c) => {
+        if (labelTr.classList.contains(c) !== (c === rowCls)) labelTr.classList.toggle(c, c === rowCls);
+      });
+      // barva se dává přímo na buňku hlavičky (celá výška řádku DC i s odsazením),
+      // inline s !important, aby ji styly DC nepřebily
+      const cell = labelTr.querySelector(':scope > td');
+      if (cell) {
+        const look = ROW_LOOK[rowCls] || null;
+        // prohlížeč hodnoty normalizuje (rgba → rgb…), proto se změna pozná podle
+        // uloženého klíče + toho, jestli tam !important pořád je (ne porovnáním textu)
+        const setImp = (el, prop, val) => {
+          if (val == null) { if (el.style.getPropertyValue(prop)) el.style.removeProperty(prop); return; }
+          const same = el.dataset.dcLook === rowCls && el.style.getPropertyPriority(prop) === 'important';
+          if (!same) el.style.setProperty(prop, val, 'important');
+        };
+        setImp(cell, 'background', look && look.bg);
+        setImp(cell, 'box-shadow', look && look.bar);
+        const inner = cell.querySelector('.list-header-row');
+        if (inner) setImp(inner, 'background', look ? 'transparent' : null);   // ať nepřekrývá barvu buňky
+        if (cell.dataset.dcLook !== rowCls) { if (rowCls) cell.dataset.dcLook = rowCls; else delete cell.dataset.dcLook; }
+        if (inner && inner.dataset.dcLook !== rowCls) { if (rowCls) inner.dataset.dcLook = rowCls; else delete inner.dataset.dcLook; }
+      }
+
       // ztlumení skupiny "Neřešit"
       let el = labelTr;
       while (el) {
         if (el !== labelTr && el.classList.contains('group-label')) break;
-        el.classList.toggle('dc-mode-skip-row', skip);
+        if (el.classList.contains('dc-mode-skip-row') !== skip) el.classList.toggle('dc-mode-skip-row', skip);
         el = el.nextElementSibling;
       }
     });
