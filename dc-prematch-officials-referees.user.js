@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DC – Prematch Officials
 // @namespace    dkode.dc.referee
-// @version      3.9.0
+// @version      3.9.1
 // @description  Sloupec "Referee available" se jménem rozhodčího z Google tabulky (klik = otevře Lineups a doplní rozhodčího), Check v DC → Hotovo = TRUE, klik na pitchera = doplní nadhazovače do soupisky (baseball), Lineups → automatické hledání rozhodčích podle sportu, "Check all" a "Bez rozhodčích" u soutěží
 // @match        https://dc.livesport.eu/data/data-checking/prematch-officials*
 // @match        https://dc.livesport.eu/data/data-checking/prematch-resources*
@@ -990,6 +990,7 @@
 
   // ── Postupné vyplnění slotů ─────────────────────────────────────────────────
   async function openSearchesSequentially(slots, names, alive) {
+    let changed = false;   // vyplnil tento běh aspoň jeden slot?
     for (let slotIndex = 0; slotIndex < slots; slotIndex++) {
       if (!alive()) return;
       const table = getLiveOfficialsTable();
@@ -1027,8 +1028,12 @@
       if (filled === 'aborted') { log('aborted – another Lineups was opened'); return; }
       if (!filled) { log(`timeout waiting for slot ${slotIndex + 1}, aborting`); return; }
       log(`slot ${slotIndex + 1} filled`);
+      changed = true;
       await sleep(AFTER_SELECTION_WAIT_MS);
     }
+
+    // Všichni rozhodčí už byli doplnění předem → nic neukládat, soupiska zůstane otevřená
+    if (!changed) { log('all referee slots already filled – nothing to save'); return; }
 
     // Uložit jen když jsou opravdu VŠECHNY sloty vyplněné
     const finalTable = getLiveOfficialsTable();
