@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DC – Prematch Officials
 // @namespace    dkode.dc.referee
-// @version      3.9.1
-// @description  Sloupec "Referee available" se jménem rozhodčího z Google tabulky (klik = otevře Lineups a doplní rozhodčího), Check v DC → Hotovo = TRUE, klik na pitchera = doplní nadhazovače do soupisky (baseball), Lineups → automatické hledání rozhodčích podle sportu, "Check all" a "Bez rozhodčích" u soutěží
+// @version      3.10.0
+// @description  Sloupec "Referee available" se jménem rozhodčího z Google tabulky (klik = otevře Lineups a doplní rozhodčího), Check v DC → Hotovo = TRUE, klik na pitchera = doplní nadhazovače do soupisky (baseball), Lineups → automatické hledání rozhodčích podle sportu, "Check all" a "Bez rozhodčích" u soutěží, štítky Scan / Ruční skript podle listu Soutěže
 // @match        https://dc.livesport.eu/data/data-checking/prematch-officials*
 // @match        https://dc.livesport.eu/data/data-checking/prematch-resources*
 // @grant        GM_xmlhttpRequest
@@ -150,11 +150,18 @@
   let pStatus = 'loading';
   let pStatusMsg = '';
 
+  // --- Soutěže: list "Soutěže" ve stejné tabulce -----------------------------
+  const COMP_GID = '674311894';
+  const COMP_ID_COLUMN = 'DC template ID';
+  const COMP_SCAN_COLUMN = 'Scan';
+  const COMP_MANUAL_COLUMN = 'Ruční skript';
+  let compMap = new Map();       // tournament template ID -> { scan, manual }
+
   // --- nastavení přes menu Tampermonkey -------------------------------------
   const getSheetUrl = () => GM_getValue('sheetUrl', DEFAULT_SHEET_URL);
   function askSheetUrl() {
     const url = prompt('Vlož odkaz na Google tabulku (včetně #gid=… pro konkrétní list):', getSheetUrl());
-    if (url !== null) { GM_setValue('sheetUrl', url.trim()); loadSheet(); loadPitchers(); }
+    if (url !== null) { GM_setValue('sheetUrl', url.trim()); loadSheet(); loadPitchers(); loadCompetitions(); }
   }
   GM_registerMenuCommand('Nastavit Google tabulku s rozhodčími', askSheetUrl);
 
@@ -167,10 +174,10 @@
   }
   function askPitcherSheetUrl() {
     const url = prompt('Odkaz na list s pitchery (prázdné = stejná tabulka, list ' + PITCHER_GID + '):', GM_getValue('pitcherSheetUrl', ''));
-    if (url !== null) { GM_setValue('pitcherSheetUrl', url.trim()); loadPitchers(); }
+    if (url !== null) { GM_setValue('pitcherSheetUrl', url.trim()); loadPitchers(); loadCompetitions(); }
   }
   GM_registerMenuCommand('Nastavit list s pitchery', askPitcherSheetUrl);
-  GM_registerMenuCommand('Znovu načíst tabulku', () => { loadSheet(); loadPitchers(); });
+  GM_registerMenuCommand('Znovu načíst tabulku', () => { loadSheet(); loadPitchers(); loadCompetitions(); });
 
   const getWebAppUrl = () => GM_getValue('webAppUrl', '');
   const getSecret = () => GM_getValue('webAppSecret', '');
@@ -323,6 +330,50 @@
     });
   }
 
+  // List Soutěže: DC template ID → zpracování přes Scan / Ruční skript (hodnota "ano")
+  function getCompSheetUrl() {
+    const m = getSheetUrl().match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
+    return m ? `https://docs.google.com/spreadsheets/d/${m[1]}/edit#gid=${COMP_GID}` : '';
+  }
+  const isYes = (v) => /^(ano|true|pravda|x|1|✓|✔|yes)$/i.test(String(v || '').trim());
+
+  function loadCompetitions() {
+    const csvUrl = buildCsvUrl(getCompSheetUrl() || '');
+    if (!csvUrl) return;
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url: csvUrl,
+      onload: (res) => {
+        const text = res.responseText || '';
+        if (res.status !== 200 || /^\s*<(!doctype|html)/i.test(text)) {
+          console.log('[DC Officials]', `list Soutěže se nepodařilo načíst (HTTP ${res.status})`);
+          return;
+        }
+        const rows = parseCsv(text);
+        let headerRow = -1, idIdx = -1, scanIdx = -1, manIdx = -1;
+        for (let i = 0; i < Math.min(HEADER_SEARCH_ROWS, rows.length); i++) {
+          const a = resolveColumn(rows[i], COMP_ID_COLUMN, []);
+          const b = resolveColumn(rows[i], COMP_SCAN_COLUMN, []);
+          const c = resolveColumn(rows[i], COMP_MANUAL_COLUMN, []);
+          if (a >= 0 && b >= 0 && c >= 0) { headerRow = i; idIdx = a; scanIdx = b; manIdx = c; break; }
+        }
+        if (headerRow < 0) {
+          console.log('[DC Officials]', `v listu Soutěže chybí sloupce "${COMP_ID_COLUMN}", "${COMP_SCAN_COLUMN}" nebo "${COMP_MANUAL_COLUMN}"`);
+          return;
+        }
+        const map = new Map();
+        for (const r of rows.slice(headerRow + 1)) {
+          const id = String(r[idIdx] || '').replace(/\D/g, '');
+          if (id) map.set(id, { scan: isYes(r[scanIdx]), manual: isYes(r[manIdx]) });
+        }
+        compMap = map;
+        console.log('[DC Officials]', `list Soutěže: ${map.size} soutěží`);
+        annotateCompetitionModes();
+      },
+      onerror: () => console.log('[DC Officials]', 'chyba sítě při načítání listu Soutěže'),
+    });
+  }
+
   // --- styly -----------------------------------------------------------------
   const style = document.createElement('style');
   style.textContent = `
@@ -348,6 +399,16 @@
     td.${PITCH_COL_CLASS} .ref-done { color: #28a745; margin-left: 4px; }
     td.${PITCH_COL_CLASS} .ref-sending { margin-left: 4px; }
     td.${PITCH_COL_CLASS} .ref-fail { color: #dc3545; margin-left: 4px; }
+    .dc-mode-badge {
+      display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.04em; padding: 2px 6px; border-radius: 4px; margin-left: 6px; white-space: nowrap;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    .dc-mode-badges { display: inline; }
+    .dc-mode-badge.mode-scan   { background: rgba(21,101,192,0.12); color: #1565c0; }
+    .dc-mode-badge.mode-manual { background: rgba(230,120,0,0.15); color: #c25e00; }
+    .dc-mode-badge.mode-skip   { background: rgba(0,0,0,0.05); color: #888; border: 1px solid #ccc; }
+    tr.dc-mode-skip-row { opacity: 0.55; }
     .dc-ref-no-referees-badge {
       display: inline-block; background: rgba(255,0,70,0.14); color: #FF0046;
       font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
@@ -528,7 +589,7 @@
     e.preventDefault(); e.stopPropagation();
     if (status === 'nourl') { askSheetUrl(); return; }   // askSheetUrl načte oba listy
     loadSheet();
-    loadPitchers();
+    loadPitchers(); loadCompetitions();
   }, true);
 
 
@@ -1310,6 +1371,52 @@
     });
   }
 
+  // ===========================================================================
+  // ŠTÍTKY ZPRACOVÁNÍ SOUTĚŽE (list Soutěže): Scan / Ruční skript / Neřešit
+  // Soutěž, která v listu není, zůstane beze štítku. "Neřešit" = v listu je,
+  // ale nemá "ano" ani u Scan, ani u Ruční skript → skupina se ztlumí.
+  // ===========================================================================
+  function annotateCompetitionModes() {
+    document.querySelectorAll('tr.group-label').forEach((labelTr) => {
+      const tplLink = labelTr.querySelector('[id$="_path_rh_tournament_template_0"] a');
+      const stage = labelTr.querySelector('[id$="_path_rh_tournament_stage_0"]');
+      const pathContainer = (stage || tplLink?.closest('span'))?.parentElement;
+      if (!tplLink || !pathContainer) return;
+
+      const id = (tplLink.getAttribute('title') || '').replace(/\D/g, '');
+      const mode = compMap.get(id);
+      const skip = !!mode && !mode.scan && !mode.manual;
+      const key = mode ? `${mode.scan}|${mode.manual}` : '';
+
+      // štítky
+      const boxes = Array.from(pathContainer.querySelectorAll(':scope > .dc-mode-badges'));
+      boxes.slice(1).forEach((extra) => extra.remove());
+      let box = boxes[0];
+      if (!mode) { if (box) box.remove(); }
+      else {
+        if (!box) { box = document.createElement('span'); box.className = 'dc-mode-badges'; }
+        // umístit hned za "Check all" (nebo za breadcrumb), před "Bez rozhodčích"
+        const after = pathContainer.querySelector(':scope > .' + BADGE_CLASS) || stage || tplLink.closest('span');
+        if (box.previousElementSibling !== after) after.after(box);
+        if (box.dataset.key !== key) {
+          box.dataset.key = key;
+          box.innerHTML =
+            (mode.scan ? '<span class="dc-mode-badge mode-scan" title="Zpracovává se přes Scan">Scan</span>' : '') +
+            (mode.manual ? '<span class="dc-mode-badge mode-manual" title="Zpracovává se ručním scriptem">Ruční skript</span>' : '') +
+            (skip ? '<span class="dc-mode-badge mode-skip" title="Soutěž se neřeší">Neřešit</span>' : '');
+        }
+      }
+
+      // ztlumení skupiny "Neřešit"
+      let el = labelTr;
+      while (el) {
+        if (el !== labelTr && el.classList.contains('group-label')) break;
+        el.classList.toggle('dc-mode-skip-row', skip);
+        el = el.nextElementSibling;
+      }
+    });
+  }
+
   // DC tabulku překresluje → hlídat změny
   let scheduled = false;
   const observer = new MutationObserver(() => {
@@ -1321,6 +1428,7 @@
       apply();
       scanBulkBadges();
       annotateNoRefereeTournaments();
+      annotateCompetitionModes();
       observer.observe(document.body, { childList: true, subtree: true });
     });
   });
@@ -1328,9 +1436,10 @@
   apply();
   scanBulkBadges();
   annotateNoRefereeTournaments();
+  annotateCompetitionModes();
   observer.observe(document.body, { childList: true, subtree: true });
-  setInterval(() => { scanBulkBadges(); annotateNoRefereeTournaments(); }, 1500);   // pojistka, kdyby observer něco propásl
+  setInterval(() => { scanBulkBadges(); annotateNoRefereeTournaments(); annotateCompetitionModes(); }, 1500);   // pojistka, kdyby observer něco propásl
   loadSheet();
-  loadPitchers();
-  setInterval(() => { loadSheet(); loadPitchers(); }, REFRESH_MINUTES * 60 * 1000);
+  loadPitchers(); loadCompetitions();
+  setInterval(() => { loadSheet(); loadPitchers(); loadCompetitions(); }, REFRESH_MINUTES * 60 * 1000);
 })();
